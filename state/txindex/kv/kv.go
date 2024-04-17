@@ -200,8 +200,7 @@ func (txi *TxIndex) indexEvents(result *abci.TxResult, hash []byte, store dbm.Ba
 func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error) {
 	select {
 	case <-ctx.Done():
-		return make([]*abci.TxResult, 0), nil
-
+		return nil, ctx.Err()
 	default:
 	}
 
@@ -260,7 +259,10 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 				continue
 			}
 			if !hashesInitialized {
-				filteredHashes = txi.matchRange(ctx, qr, startKey(qr.Key), filteredHashes, true, heightInfo)
+				filteredHashes, err = txi.matchRange(ctx, qr, startKey(qr.Key), filteredHashes, true, heightInfo)
+				if err != nil {
+					return nil, err
+				}
 				hashesInitialized = true
 
 				// Ignore any remaining conditions if the first condition resulted
@@ -269,7 +271,10 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 					break
 				}
 			} else {
-				filteredHashes = txi.matchRange(ctx, qr, startKey(qr.Key), filteredHashes, false, heightInfo)
+				filteredHashes, err = txi.matchRange(ctx, qr, startKey(qr.Key), filteredHashes, false, heightInfo)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -283,7 +288,10 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 		}
 
 		if !hashesInitialized {
-			filteredHashes = txi.match(ctx, c, startKeyForCondition(c, heightInfo.height), filteredHashes, true, heightInfo)
+			filteredHashes, err = txi.match(ctx, c, startKeyForCondition(c, heightInfo.height), filteredHashes, true, heightInfo)
+			if err != nil {
+				return nil, err
+			}
 			hashesInitialized = true
 
 			// Ignore any remaining conditions if the first condition resulted
@@ -292,7 +300,10 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 				break
 			}
 		} else {
-			filteredHashes = txi.match(ctx, c, startKeyForCondition(c, heightInfo.height), filteredHashes, false, heightInfo)
+			filteredHashes, err = txi.match(ctx, c, startKeyForCondition(c, heightInfo.height), filteredHashes, false, heightInfo)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -348,11 +359,11 @@ func (txi *TxIndex) match(
 	filteredHashes map[string][]byte,
 	firstRun bool,
 	heightInfo HeightInfo,
-) map[string][]byte {
+) (map[string][]byte, error) {
 	// A previous match was attempted but resulted in no matches, so we return
 	// no matches (assuming AND operand).
 	if !firstRun && len(filteredHashes) == 0 {
-		return filteredHashes
+		return filteredHashes, nil
 	}
 
 	tmpHashes := make(map[string][]byte)
@@ -361,12 +372,18 @@ func (txi *TxIndex) match(
 	case query.OpEqual:
 		it, err := dbm.IteratePrefix(txi.store, startKeyBz)
 		if err != nil {
-			panic(err)
+			// panic(err)
+			return nil, err
 		}
 		defer it.Close()
 
-	EQ_LOOP:
 		for ; it.Valid(); it.Next() {
+			// Potentially exit early.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
 
 			// If we have a height range in a query, we need only transactions
 			// for this height
@@ -376,12 +393,6 @@ func (txi *TxIndex) match(
 			}
 
 			txi.setTmpHashes(tmpHashes, it)
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break EQ_LOOP
-			default:
-			}
 		}
 		if err := it.Error(); err != nil {
 			panic(err)
@@ -396,20 +407,19 @@ func (txi *TxIndex) match(
 		}
 		defer it.Close()
 
-	EXISTS_LOOP:
 		for ; it.Valid(); it.Next() {
+			// Potentially exit early.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+
 			keyHeight, err := extractHeightFromKey(it.Key())
 			if err != nil || !checkHeightConditions(heightInfo, keyHeight) {
 				continue
 			}
 			txi.setTmpHashes(tmpHashes, it)
-
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break EXISTS_LOOP
-			default:
-			}
 		}
 		if err := it.Error(); err != nil {
 			panic(err)
@@ -421,12 +431,19 @@ func (txi *TxIndex) match(
 		// we can't iterate with prefix "account.owner/an/" because we might miss keys like "account.owner/Ulan/"
 		it, err := dbm.IteratePrefix(txi.store, startKey(c.CompositeKey))
 		if err != nil {
-			panic(err)
+			// panic(err)
+			return nil, err
 		}
 		defer it.Close()
 
-	CONTAINS_LOOP:
 		for ; it.Valid(); it.Next() {
+			// Potentially exit early.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+
 			if !isTagKey(it.Key()) {
 				continue
 			}
@@ -437,13 +454,6 @@ func (txi *TxIndex) match(
 					continue
 				}
 				txi.setTmpHashes(tmpHashes, it)
-			}
-
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break CONTAINS_LOOP
-			default:
 			}
 		}
 		if err := it.Error(); err != nil {
@@ -461,27 +471,26 @@ func (txi *TxIndex) match(
 		// return no matches (assuming AND operand).
 		//
 		// 2. A previous match was not attempted, so we return all results.
-		return tmpHashes
+		return tmpHashes, nil
 	}
 
 	// Remove/reduce matches in filteredHashes that were not found in this
 	// match (tmpHashes).
-REMOVE_LOOP:
 	for k, v := range filteredHashes {
+		// Potentially exit early.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		tmpHash := tmpHashes[k]
 		if tmpHash == nil || !bytes.Equal(tmpHash, v) {
 			delete(filteredHashes, k)
-
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break REMOVE_LOOP
-			default:
-			}
 		}
 	}
 
-	return filteredHashes
+	return filteredHashes, nil
 }
 
 // matchRange returns all matching txs by hash that meet a given queryRange and
@@ -496,11 +505,11 @@ func (txi *TxIndex) matchRange(
 	filteredHashes map[string][]byte,
 	firstRun bool,
 	heightInfo HeightInfo,
-) map[string][]byte {
+) (map[string][]byte, error) {
 	// A previous match was attempted but resulted in no matches, so we return
 	// no matches (assuming AND operand).
 	if !firstRun && len(filteredHashes) == 0 {
-		return filteredHashes
+		return filteredHashes, nil
 	}
 
 	tmpHashes := make(map[string][]byte)
@@ -513,6 +522,13 @@ func (txi *TxIndex) matchRange(
 
 LOOP:
 	for ; it.Valid(); it.Next() {
+		// Potentially exit early.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		if !isTagKey(it.Key()) {
 			continue
 		}
@@ -542,13 +558,6 @@ LOOP:
 			// 		break
 			// 	}
 		}
-
-		// Potentially exit early.
-		select {
-		case <-ctx.Done():
-			break LOOP
-		default:
-		}
 	}
 	if err := it.Error(); err != nil {
 		panic(err)
@@ -562,27 +571,26 @@ LOOP:
 		// return no matches (assuming AND operand).
 		//
 		// 2. A previous match was not attempted, so we return all results.
-		return tmpHashes
+		return tmpHashes, nil
 	}
 
 	// Remove/reduce matches in filteredHashes that were not found in this
 	// match (tmpHashes).
-REMOVE_LOOP:
 	for k, v := range filteredHashes {
+		// Potentially exit early.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		tmpHash := tmpHashes[k]
 		if tmpHash == nil || !bytes.Equal(tmpHashes[k], v) {
 			delete(filteredHashes, k)
-
-			// Potentially exit early.
-			select {
-			case <-ctx.Done():
-				break REMOVE_LOOP
-			default:
-			}
 		}
 	}
 
-	return filteredHashes
+	return filteredHashes, nil
 }
 
 // Keys
